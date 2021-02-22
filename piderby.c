@@ -15,7 +15,7 @@
 #define PARITY    UART_PARITY_NONE
 #define UART_TX_PIN 0
 #define UART_RX_PIN 1
-
+#define GATE_PIN 22
 
 uint8_t numLanes = 8;
 uint8_t numDec = 4;
@@ -23,15 +23,17 @@ uint8_t gpio[] = {11,12,13,14,15,16,17,18};
 uint64_t laneTicks[8];
 uint8_t laneFinishPosition[8];
 uint64_t previousTicks;
-uint16_t positionAllowance = 500;
+uint16_t positionAllowance = 1;
 uint8_t char_rxed = 0;
 uint8_t positionMarker[4]={'a','A','1','!'};
 uint8_t positionIndex = 0;
 uint8_t laneMarker[4] = {'A','1','a','A'};
 uint8_t laneIndex = 0;
 int32_t alarmID;
+uint8_t resetTime = 0; // seconds between automatic reset between races
 
-static char msg[50];
+char msg[50];
+char * msgptr=msg;
 
 bool racing = false;
 bool masking = false;
@@ -84,6 +86,15 @@ int64_t alarm_callback(alarm_id_t id, void *user_data) {
     return 0;
 }
 
+void reset(void) {
+    gpio_set_irq_enabled(GATE_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
+    racing = false;
+    for (uint i = 0; i < numLanes; i++) {
+        lane_enable(i, false);
+    }
+    uart_puts(UART_ID,"OK\r\n");
+}
+
 void start_race() {
     racing = true;
     previousTicks = time_us_64 ();
@@ -95,6 +106,7 @@ void start_race() {
         laneTicks[i] = previousTicks + 9999999;
     }
     uart_puts(UART_ID, "!\r\n");
+    gpio_set_irq_enabled(GATE_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
 }
 
 void on_uart_rx() {
@@ -117,33 +129,16 @@ void process_command(const char* message) {
     switch (toupper(message[0])) {
         case 'A': // set allowance for finish position
             if (message[1] != 0) {
-                uint8_t length = strlen(message) - 1;
-                uint16_t converted = 0;
-                bool goodconversion = true;
-                for (uint i = 0; i < length; i++) {
-                    uint8_t chardec = message[i + 1] - '0';
-                    if (chardec >= 0 && chardec <= 9) {
-                        converted += pow(10,(length - 1 - i)) * chardec;
-                    }
-                    else {
-                        goodconversion = false;
-                        break;
-                    }
-                }
-                if (goodconversion) {
-                    positionAllowance = converted;
-                    uart_puts(UART_ID,"OK\r\n");
-                }
-                else {
-                    uart_puts(UART_ID, "?\r\n");
-                }
+                char substr[20];
+                strcpy(substr, &(message[1]));
+                positionAllowance = atoi(substr);
+                uart_puts(UART_ID,"OK\r\n");
             }
             else {
                 char convertido[6];
                 sprintf(convertido, "%u", positionAllowance);
                 uart_puts(UART_ID, convertido);
                 uart_puts(UART_ID, "\r\n");
-                
             }
             break;
         case 'R':
@@ -166,7 +161,7 @@ void process_command(const char* message) {
                     uart_puts(UART_ID, "\r\n");
                     break;
                 case 'S': // Read start switch
-                    if (gpio_get(22)) uart_puts(UART_ID, "1\r\n");
+                    if (gpio_get(GATE_PIN)) uart_puts(UART_ID, "1\r\n");
                     else uart_puts(UART_ID, "0\r\n");
                     break;
                 case 'L': // Read lane switches
@@ -176,8 +171,10 @@ void process_command(const char* message) {
                     }
                     uart_puts(UART_ID, "\r\n");
                     break;
-                default: // Reset
-                    uart_puts(UART_ID, "\r\n");
+                case '\0': // Reset
+                    reset();
+                    break;
+                default: 
                     break;
             }
             break;
@@ -256,8 +253,19 @@ void process_command(const char* message) {
 
 
                     break;
-                case 'R': // Set / Read automatic reset delay (or/or0/orxx)
-                    uart_puts(UART_ID, "OK\r\n");
+                case 'R': // Set / Read automatic reset delay (or/or0/orxx) - GPRM sends 'or0'
+                    if (message[2] == 0) { // display the reset time
+                        char convertido[6];
+                        sprintf(convertido, "%u", resetTime);
+                        uart_puts(UART_ID, convertido);
+                        uart_puts(UART_ID, "\r\n");
+                    }
+                    else {
+                        char substr[20];
+                        strcpy(substr, &(message[2]));
+                        resetTime = atoi(substr);
+                        uart_puts(UART_ID,"OK\r\n");
+                    }
                     break;
                 case 'V': // Lane reversal (ov/ov1/ov0) - GPRM sends 'ov0'
                     uart_puts(UART_ID, "OK\r\n");
@@ -285,7 +293,7 @@ void process_command(const char* message) {
 }
 
 void gpio_callback(uint gpio, uint32_t events) {
-    if (gpio == 22) {
+    if (gpio == GATE_PIN) {
         if (events == 0x8) { // edge rising - switch open
             start_race();
         }
@@ -367,8 +375,10 @@ bool are_we_done(void) {
         cancel_alarm(alarmID);
         racing = false;
         print_finish_order();
+        gpio_set_irq_enabled(GATE_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
     }
 }
+
 
 int main() {
     uart_init(UART_ID, 2400);
@@ -385,7 +395,7 @@ int main() {
     
     uart_puts(UART_ID, "\r\n\n\n\nPiderby 2021\r\n");
 
-    gpio_set_irq_enabled_with_callback(22, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &gpio_callback);
+    gpio_set_irq_enabled_with_callback(GATE_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &gpio_callback);
 
     for (uint8_t i = 0; i < numLanes; i++) {
         gpio_init(gpio[i]);
