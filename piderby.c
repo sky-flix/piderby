@@ -72,7 +72,9 @@ int laneindexSort(const void *a, const void *b) {
 void process_finish_order();
 void print_finish_order();
 void process_command(const char* message);
-void lane_enable(uint laneindex, bool active) {
+
+
+void lane_enable(uint8_t laneindex, bool active) {
     gpio_set_irq_enabled(gpio[laneindex], GPIO_IRQ_EDGE_FALL, active);
     laneEnabled[laneindex] = active;
 }
@@ -89,7 +91,7 @@ int64_t alarm_callback(alarm_id_t id, void *user_data) {
 void reset(void) {
     gpio_set_irq_enabled(GATE_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
     racing = false;
-    for (uint i = 0; i < numLanes; i++) {
+    for (uint8_t i = 0; i < numLanes; i++) {
         lane_enable(i, false);
     }
     uart_puts(UART_ID,"OK\r\n");
@@ -116,7 +118,7 @@ void on_uart_rx() {
             msg[char_rxed] = 0; // null terminate the string
             process_command(msg);
             char_rxed = 0;
-            for (uint i = 0; i < 50; i++) msg[i] = 0;
+            for (uint8_t i = 0; i < 50; i++) msg[i] = 0;
         }
         else {
             msg[char_rxed] = ch;
@@ -128,46 +130,46 @@ void on_uart_rx() {
 void process_command(const char* message) {
     switch (toupper(message[0])) {
         case 'A': // set allowance for finish position
-            if (message[1] != 0) {
-                char substr[20];
-                strcpy(substr, &(message[1]));
-                positionAllowance = atoi(substr);
-                uart_puts(UART_ID,"OK\r\n");
-            }
-            else {
+            if (message[1] == 0) {
                 char convertido[6];
                 sprintf(convertido, "%u", positionAllowance);
                 uart_puts(UART_ID, convertido);
                 uart_puts(UART_ID, "\r\n");
+            }
+            else {
+                char substr[20];
+                strcpy(substr, &(message[1]));
+                positionAllowance = atoi(substr);
+                uart_puts(UART_ID,"OK\r\n");
             }
             break;
         case 'R':
             switch (toupper(message[1])) {
                 case 'A': // Force end of race, return results, then reset
                     racing = false;
-                    for (uint i = 0; i < numLanes; i++) {
+                    for (uint8_t i = 0; i < numLanes; i++) {
                         laneEnabled[i] = false;
                         lane_enable(i, false);
                     }
                     print_finish_order();
                     break;
-                case 'G':
+                case 'G': // return results at end of race (we do that anyway, so just acknowledge)
                     uart_puts(UART_ID, "\r\n");
                     break;
                 case 'P': // Return reesults from previous race
                     print_finish_order();
                     break;
-                case 'R': // Read reset switch
+                case 'R': // Read reset switch - active if gate is closed and ready for race
+                    uart_putc(UART_ID, (int)(!gpio_get(GATE_PIN)) + '0');
                     uart_puts(UART_ID, "\r\n");
                     break;
-                case 'S': // Read start switch
-                    if (gpio_get(GATE_PIN)) uart_puts(UART_ID, "1\r\n");
-                    else uart_puts(UART_ID, "0\r\n");
+                case 'S': // Read start switch - active is gate is open and racing
+                    uart_putc(UART_ID, (int)(gpio_get(GATE_PIN)) + '0');
+                    uart_puts(UART_ID, "\r\n");
                     break;
                 case 'L': // Read lane switches
-                    for (uint i = 0; i < numLanes; i++) {
-                        if (gpio_get(gpio[i])) uart_putc(UART_ID, '1');
-                        else uart_putc(UART_ID, '0');
+                    for (uint8_t i = 0; i < numLanes; i++) {
+                        uart_putc(UART_ID, (int)(gpio_get(gpio[i])) + '0');
                     }
                     uart_puts(UART_ID, "\r\n");
                     break;
@@ -208,7 +210,7 @@ void process_command(const char* message) {
                     break;
                 case 'M': // Set Read lane mask
                     if (message[2] == 0) { // show the masked lanes
-                        for (uint i = 0; i < numLanes; i++ ) {
+                        for (uint8_t i = 0; i < numLanes; i++ ) {
                             if (laneMasked[i]) uart_putc(UART_ID, i + '1');
                         }
                         uart_puts(UART_ID,"\r\n");
@@ -220,7 +222,7 @@ void process_command(const char* message) {
                             uart_puts(UART_ID,"OK\r\n");
                         }
                         else if (chardec == 0) {
-                            for (uint i = 0; i < numLanes; i++ ) {
+                            for (uint8_t i = 0; i < numLanes; i++ ) {
                                 laneMasked[i] = false;
                             }
                             uart_puts(UART_ID,"OK\r\n");
@@ -283,7 +285,7 @@ void process_command(const char* message) {
 
             break;
         case 'V':
-            uart_puts(UART_ID,"Piderby Timer\r\n");
+            uart_puts(UART_ID,"eTekGadget SmartLine Timer\r\n");
             break;
         default: // no idea what to do
             uart_puts(UART_ID, "?\r\n");
@@ -294,10 +296,10 @@ void process_command(const char* message) {
 
 void gpio_callback(uint gpio, uint32_t events) {
     if (gpio == GATE_PIN) {
-        if (events == 0x8) { // edge rising - switch open
+        if (events == 0x4) { // edge falling - switch closed
             start_race();
         }
-        else {  // must be edge falling - switch closed
+        else {  // must be something else - assume switch open
             uart_puts(UART_ID, "@\r\n"); // to mimic fast track timers
         }
     }
@@ -308,7 +310,7 @@ void gpio_callback(uint gpio, uint32_t events) {
 }
 
 void process_finish_order (void) {
-    for (uint i = 0; i < numLanes; i++) {
+    for (uint8_t i = 0; i < numLanes; i++) {
         raceData[i].laneticks = round((float)(laneTicks[i] - previousTicks) / 10);;
         raceData[i].laneindex = i;
     }
@@ -342,15 +344,15 @@ void print_finish_order (void) {
         sprintf(convertido, "%.5f", time);
 
         if (!laneMasked[i]) {
-            uint strLength;
+            uint8_t strLength;
             if (time >= 10) strLength = numDec + 3;
             else strLength = numDec + 2;
 
-            for (uint i = 0; i < strLength; i++) uart_putc(UART_ID, convertido[i]);
+            for (uint8_t i = 0; i < strLength; i++) uart_putc(UART_ID, convertido[i]);
         }
         else {
             uart_puts(UART_ID, "10.");
-            for (uint i = 0; i < numDec; i++) uart_putc(UART_ID,'0');
+            for (uint8_t i = 0; i < numDec; i++) uart_putc(UART_ID,'0');
         }
         if (laneFinishPosition[i]) {
             uart_putc(UART_ID, (char)(laneFinishPosition[i] - 1 + positionMarker[positionIndex]));
@@ -407,7 +409,7 @@ int main() {
         if (racing) {
             are_we_done();
         }
-        sleep_us(5);
+        sleep_us(10);
     }
 
     return 0;
