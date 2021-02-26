@@ -98,17 +98,15 @@ void reset(void) {
 }
 
 void start_race() {
-    racing = true;
     previousTicks = time_us_64 ();
     alarmID = add_alarm_in_ms(10000, alarm_callback, NULL, false);
     for (uint8_t i = 0; i < numLanes; i++) {
-        if (!laneMasked[i]) {
-            lane_enable(i, true);
-        }
+        lane_enable(i, !laneMasked[i]);
         laneTicks[i] = previousTicks + 9999999;
     }
-    uart_puts(UART_ID, "!\r\n");
+    uart_puts(UART_ID, "They're off!\r\n");
     gpio_set_irq_enabled(GATE_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
+    racing = true;
 }
 
 void on_uart_rx() {
@@ -160,16 +158,17 @@ void process_command(const char* message) {
                     print_finish_order();
                     break;
                 case 'R': // Read reset switch - active if gate is closed and ready for race
-                    uart_putc(UART_ID, (int)(!gpio_get(GATE_PIN)) + '0');
+                    uart_putc(UART_ID, (int)(gpio_get(GATE_PIN)) + '0');
                     uart_puts(UART_ID, "\r\n");
                     break;
                 case 'S': // Read start switch - active is gate is open and racing
-                    uart_putc(UART_ID, (int)(gpio_get(GATE_PIN)) + '0');
+                    uart_putc(UART_ID, (int)(!gpio_get(GATE_PIN)) + '0');
                     uart_puts(UART_ID, "\r\n");
                     break;
                 case 'L': // Read lane switches
                     for (uint8_t i = 0; i < numLanes; i++) {
-                        uart_putc(UART_ID, (int)(gpio_get(gpio[i])) + '0');
+                        if (!laneMasked[i]) uart_putc(UART_ID, (int)(gpio_get(gpio[i])) + '0');
+                        else uart_putc(UART_ID,'-');
                     }
                     uart_puts(UART_ID, "\r\n");
                     break;
@@ -295,13 +294,8 @@ void process_command(const char* message) {
 }
 
 void gpio_callback(uint gpio, uint32_t events) {
-    if (gpio == GATE_PIN) {
-        if (events == 0x4) { // edge falling - switch closed
-            start_race();
-        }
-        else {  // must be something else - assume switch open
-            uart_puts(UART_ID, "@\r\n"); // to mimic fast track timers
-        }
+    if (gpio == GATE_PIN && events == 0x4) {
+        start_race();
     }
     else {
         laneTicks[gpio - 11] = time_us_64 ();
