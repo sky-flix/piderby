@@ -6,6 +6,7 @@
 #include "hardware/gpio.h"
 #include "hardware/uart.h"
 #include "hardware/irq.h"
+#include "hardware/i2c.h"
 #include "math.h"
 
 #define UART_ID uart0
@@ -16,10 +17,14 @@
 #define UART_TX_PIN 0
 #define UART_RX_PIN 1
 #define GATE_PIN 22
+#define I2C_PORT i2c0
+
 
 uint8_t numLanes = 8;
 uint8_t numDec = 4;
 uint8_t gpio[] = {11,12,13,14,15,16,17,18};
+const int LaneAddresses[8] =  {0x75, 0x74, 0x73, 0x72, 0x71, 0x70, 0x69, 0x68}; // Lanes 8 through 1 (As seen from the start gate)
+
 uint64_t laneTicks[8];
 uint8_t laneFinishPosition[8];
 uint64_t previousTicks;
@@ -28,6 +33,8 @@ uint8_t char_rxed = 0;
 uint8_t positionMarker[4]={'a','A','1','!'};
 uint8_t positionIndex = 0;
 uint8_t laneMarker[4] = {'A','1','a','A'};
+char dnf[5]={' ','d','n','F','\0'};
+
 uint8_t laneIndex = 0;
 int32_t alarmID;
 uint8_t resetTime = 0; // seconds between automatic reset between races
@@ -69,10 +76,19 @@ int laneindexSort(const void *a, const void *b) {
         return 0;
 }
 
+int hz = 25;
+repeating_timer_t timer1,timer2;
+
 void process_finish_order();
 void print_finish_order();
 void process_command(const char* message);
+bool send_times(repeating_timer_t *rt);
+bool send_positions(repeating_timer_t *rt);
+void rotate_displays(bool enable);
+void clear_displays(void);
 
+void lane_text(uint8_t laneindex, const char* text);
+void lane_time(uint8_t laneindex, const char* time);
 
 void lane_enable(uint8_t laneindex, bool active) {
     gpio_set_irq_enabled(gpio[laneindex], GPIO_IRQ_EDGE_FALL, active);
@@ -158,11 +174,11 @@ void process_command(const char* message) {
                     print_finish_order();
                     break;
                 case 'R': // Read reset switch - active if gate is closed and ready for race
-                    uart_putc(UART_ID, (int)(gpio_get(GATE_PIN)) + '0');
+                    uart_putc(UART_ID, (int)(!gpio_get(GATE_PIN)) + '0');
                     uart_puts(UART_ID, "\r\n");
                     break;
                 case 'S': // Read start switch - active is gate is open and racing
-                    uart_putc(UART_ID, (int)(!gpio_get(GATE_PIN)) + '0');
+                    uart_putc(UART_ID, (int)(gpio_get(GATE_PIN)) + '0');
                     uart_puts(UART_ID, "\r\n");
                     break;
                 case 'L': // Read lane switches
@@ -294,8 +310,14 @@ void process_command(const char* message) {
 }
 
 void gpio_callback(uint gpio, uint32_t events) {
-    if (gpio == GATE_PIN && events == 0x4) {
-        start_race();
+    if (gpio == GATE_PIN) {
+        if (events == 0x8) {
+            start_race();
+        }
+        else {
+            rotate_displays(false); // The gate is up and we are preparing for a new race - stop displaying the previous race's data
+            clear_displays();
+        }
     }
     else {
         laneTicks[gpio - 11] = time_us_64 ();
@@ -371,11 +393,87 @@ bool are_we_done(void) {
         cancel_alarm(alarmID);
         racing = false;
         print_finish_order();
+        rotate_displays(true);
         gpio_set_irq_enabled(GATE_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
     }
     return done;
 }
 
+void lane_text(uint8_t laneindex, const char* text) {
+    char clear = 'v'; //0x76
+    i2c_write_blocking(I2C_PORT, LaneAddresses[laneindex], &clear, 1, true);
+    i2c_write_blocking(I2C_PORT, LaneAddresses[laneindex], text, strlen(text), false);
+}
+
+void lane_time(uint8_t laneindex, const char* time) {
+    char clear = 'v'; //0x76
+    char dec[3]={0x77,0x01,0}; // enable decimal control and turn on the first bit
+    i2c_write_blocking(I2C_PORT, LaneAddresses[laneindex], &clear, 1, true);
+    
+    //write the time digits
+    i2c_write_blocking(I2C_PORT, LaneAddresses[laneindex], time, 1, true);  // the whole digit
+    i2c_write_blocking(I2C_PORT, LaneAddresses[laneindex], &(time[2]), 3, true); // the first three digits of the time, skipping the decimal point in the string
+    
+    //write the decimal point
+    i2c_write_blocking(I2C_PORT, LaneAddresses[laneindex], dec, 2, false);
+}
+
+
+bool send_times(repeating_timer_t *rt) {
+   for (uint8_t i = 0; i < numLanes; i++) {
+
+        float time = (float)raceData[i].laneticks / 100000;
+        char convertido[16];
+        sprintf(convertido, "%.3f", time);
+
+        if (!laneMasked[i] && time < 10) {
+            lane_time(i,convertido);
+        }
+        else {
+            lane_text(i,dnf);
+        }
+    }
+}
+
+bool send_positions(repeating_timer_t *rt) {
+    char message[5];
+    message[0]=' ';
+    message[1]=' ';
+    message[3]=' ';
+    message[4]='\0';
+        for (uint8_t i = 0; i < numLanes; i++) {
+        if (!laneMasked[i] && raceData[i].laneticks / 100000 < 10) {
+            message[2]='0' + laneFinishPosition[i];
+            lane_text(i,message);
+        }
+        else {
+            lane_text(i,dnf);
+        }
+    }
+}
+
+void rotate_displays(bool enable) {
+    if (enable) { // enable recurring timers to send times and send positions
+        if (!add_repeating_timer_us(-8000000 / hz, send_times, NULL, &timer1)) { // send times every 8 seconds
+            // something bad happened
+        }
+        sleep_ms(4000);
+        if (!add_repeating_timer_us(-8000000 / hz, send_positions, NULL, &timer2)) { // wait 4 seconds and start sending lane positions every 8 seconds
+            // something bad happened
+        }
+    }
+    else {  // disable recorring timers to send times and send positions.
+        cancel_repeating_timer(&timer1);
+        cancel_repeating_timer(&timer2);
+    }
+}
+
+void clear_displays(void) {
+    char clear[2] = {'v','\0'};
+    for (uint8_t i = 0; i < numLanes; i++) {
+        i2c_write_blocking(I2C_PORT, LaneAddresses[i], clear, strlen(clear), false);
+    }
+}
 
 int main() {
     uart_init(UART_ID, 2400);
@@ -390,7 +488,26 @@ int main() {
     uart_set_irq_enables(UART_ID, true, false);
     uart_set_fifo_enabled(UART_ID, false);
     
-    uart_puts(UART_ID, "\r\n\nPiderby 2021\r\n");
+    i2c_init(I2C_PORT, 400 * 1000);
+    gpio_set_function(4, GPIO_FUNC_I2C);
+    gpio_set_function(5, GPIO_FUNC_I2C);
+    gpio_pull_up(4);
+    gpio_pull_up(5);
+
+
+    uart_puts(UART_ID, "\r\nPiderby\r\n");
+
+    char buf[5];
+    buf[0]=' ';
+    buf[1]='L';
+    buf[3]=' ';
+    buf[4]='\0';
+
+    for (uint8_t i = 0; i < numLanes; i++) {
+        buf[2]='1' + i;
+        lane_text(i,buf);
+    }
+    
 
     gpio_set_irq_enabled_with_callback(GATE_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &gpio_callback);
 
