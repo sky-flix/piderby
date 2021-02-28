@@ -373,6 +373,7 @@ bool are_we_done(void) {
         print_finish_order();
         gpio_set_irq_enabled(GATE_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
     }
+    return done;
 }
 
 
@@ -389,7 +390,7 @@ int main() {
     uart_set_irq_enables(UART_ID, true, false);
     uart_set_fifo_enabled(UART_ID, false);
     
-    uart_puts(UART_ID, "\r\n\n\n\nPiderby 2021\r\n");
+    uart_puts(UART_ID, "\r\n\nPiderby 2021\r\n");
 
     gpio_set_irq_enabled_with_callback(GATE_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &gpio_callback);
 
