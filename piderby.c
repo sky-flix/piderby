@@ -454,11 +454,11 @@ bool send_positions(repeating_timer_t *rt) {
 
 void rotate_displays(bool enable) {
     if (enable) { // enable recurring timers to send times and send positions
-        if (!add_repeating_timer_us(-8000000 / hz, send_times, NULL, &timer1)) { // send times every 8 seconds
+        if (!add_repeating_timer_ms(-8000 / hz, send_times, NULL, &timer1)) { // send times every 8 seconds
             // something bad happened
         }
         sleep_ms(4000);
-        if (!add_repeating_timer_us(-8000000 / hz, send_positions, NULL, &timer2)) { // wait 4 seconds and start sending lane positions every 8 seconds
+        if (!add_repeating_timer_ms(-8000 / hz, send_positions, NULL, &timer2)) { // wait 4 seconds and start sending lane positions every 8 seconds
             // something bad happened
         }
     }
