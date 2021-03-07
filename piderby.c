@@ -104,11 +104,17 @@ void i2c_write_byte(int laneindex, uint8_t val) {
     sleep_us(600);
 }
 
-
+void uart_print(const char* string) {
+    uart_puts(UART_ID, string);
+}
+void uart_println(const char* string) {
+    uart_puts(UART_ID, string);
+    uart_puts(UART_ID, "\r\n");
+}
 
 int64_t alarm_callback(alarm_id_t id, void *user_data) {
     // do stuff to end the incomplete race
-    uart_puts(UART_ID, "Race did not complete\r\n");
+    uart_println("Race did not complete");
     for (uint8_t i = 0; i < numLanes; i++) {
         lane_enable(i, false);
     }
@@ -121,7 +127,7 @@ void reset(void) {
     for (uint8_t i = 0; i < numLanes; i++) {
         lane_enable(i, false);
     }
-    uart_puts(UART_ID,"OK\r\n");
+    uart_println("OK");
 }
 
 void prepare_race(void) {
@@ -135,7 +141,7 @@ void start_race() {
         lane_enable(i, !laneMasked[i]);
         laneTicks[i] = previousTicks + 9999999;
     }
-    uart_puts(UART_ID, "They're off!\r\n");
+    uart_println("They're off!");
     gpio_set_irq_enabled(GATE_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
     racing = true;
 }
@@ -162,14 +168,13 @@ void process_command(const char* message) {
             if (message[1] == 0) {
                 char convertido[6];
                 sprintf(convertido, "%u", positionAllowance);
-                uart_puts(UART_ID, convertido);
-                uart_puts(UART_ID, "\r\n");
+                uart_println(convertido);
             }
             else {
                 char substr[20];
                 strcpy(substr, &(message[1]));
                 positionAllowance = atoi(substr);
-                uart_puts(UART_ID,"OK\r\n");
+                uart_println("OK");
             }
             break;
         case 'R':
@@ -182,26 +187,21 @@ void process_command(const char* message) {
                     }
                     print_finish_order();
                     break;
-                case 'G': // return results at end of race (we do that anyway, so just acknowledge)
-                    uart_puts(UART_ID, "\r\n");
-                    break;
                 case 'P': // Return reesults from previous race
                     print_finish_order();
                     break;
                 case 'R': // Read reset switch - active if gate is closed and ready for race
-                    uart_putc(UART_ID, (int)(!gpio_get(GATE_PIN)) + '0');
-                    uart_puts(UART_ID, "\r\n");
+                    uart_println((char[2]){(int)(!gpio_get(GATE_PIN)) + '0'});  // I know this looks crazy. we're jut creating a null terminated string from a single char, created by a boolean value
                     break;
                 case 'S': // Read start switch - active is gate is open and racing
-                    uart_putc(UART_ID, (int)(gpio_get(GATE_PIN)) + '0');
-                    uart_puts(UART_ID, "\r\n");
+                    uart_println((char[2]){(int)(gpio_get(GATE_PIN)) + '0'});  // I know this looks crazy. we're jut creating a null terminated string from a single char, created by a boolean value
                     break;
                 case 'L': // Read lane switches
                     for (uint8_t i = 0; i < numLanes; i++) {
-                        if (!laneMasked[i]) uart_putc(UART_ID, (int)(gpio_get(gpio[i])) + '0');
-                        else uart_putc(UART_ID,'-');
+                        if (!laneMasked[i]) uart_print((char[2]){(int)(gpio_get(gpio[i])) + '0'});
+                        else uart_print("-");
                     }
-                    uart_puts(UART_ID, "\r\n");
+                    uart_println("");
                     break;
                 case '\0': // Reset
                     reset();
@@ -214,74 +214,70 @@ void process_command(const char* message) {
             switch (toupper(message[1])) {
                 case 'D': // Set / Read number of decimal places in the result values
                     if (message[2] == 0) {  // read the number of decimal places
-                        uart_putc(UART_ID, numDec + '0');
-                        uart_puts(UART_ID, "\r\n");
+                        uart_println((char[2]){numDec + '0'});
                     }
                     else if ((message[2] - '0' > 2) && (message[2] - '0' < 6)) { // set the number of decimal places between 3 - 5
                         numDec = message[2] - '0';
-                        uart_puts(UART_ID, "OK\r\n");
+                        uart_println("OK");
                     }
-                    else uart_puts(UART_ID, "?\r\n");                
+                    else uart_println("?");
                     break;
                 case 'F': // set/read photo finish trigger delay -- GPRM sends 'of24'
-                    uart_puts(UART_ID, "OK\r\n");
+                    uart_println("OK");
                     break;
 
                 case 'L': // Set / Read lane character
                     if (message[2] == 0) {  // return the current marker
-                        uart_putc(UART_ID, laneMarker[laneIndex]);
-                        uart_puts(UART_ID, "\r\n");
+                        uart_println((char[2]){laneMarker[laneIndex]});
                     }
                     else if ((message[2] - '0' >= 0) && (message[2] - '0' < 4)) { // set the lane marker
                         laneIndex = message[2] - '0';
-                        uart_puts(UART_ID, "OK\r\n");
+                        uart_println("OK");
                     }
-                    else uart_puts(UART_ID, "?\r\n");
+                    else uart_println("?");
                     break;
                 case 'M': // Set Read lane mask
                     if (message[2] == 0) { // show the masked lanes
                         for (uint8_t i = 0; i < numLanes; i++ ) {
-                            if (laneMasked[i]) uart_putc(UART_ID, i + '1');
+                            if (laneMasked[i]) uart_print((char[2]){i + '1'});
                         }
-                        uart_puts(UART_ID,"\r\n");
+                        uart_println("");
                     }
                     else { 
                         uint8_t chardec = message[2] - '0';
                         if (chardec > 0 && chardec < numLanes + 1) {
                             laneMasked[chardec - 1] = true;
-                            uart_puts(UART_ID,"OK\r\n");
+                            uart_println("OK");
                         }
                         else if (chardec == 0) {
                             for (uint8_t i = 0; i < numLanes; i++ ) {
                                 laneMasked[i] = false;
                             }
-                            uart_puts(UART_ID,"OK\r\n");
+                            uart_println("OK");
                         }
-                        else uart_puts(UART_ID,"?\r\n");
+                        else uart_println("?");
                     }
                     break;
                 case 'N': // Set / Read number of lanes
                     if (message[2] == 0) {  // return the number of lanes
-                        uart_putc(UART_ID, numLanes + '0');
-                        uart_puts(UART_ID, "\r\n");
+                        uart_println((char[2]){numLanes + '0'});
                     }
                     else if ((message[2] - '0' > 0) && (message[2] - '0' < 9)) { // set the number of lanes
                         numLanes = message[2] - '0';
-                        uart_puts(UART_ID, "OK\r\n");
+                        uart_println("OK");
                     }
-                    else uart_puts(UART_ID, "?\r\n");
+                    else uart_println("?");
 
                     break;
                 case 'P': // Set / Read place character
                     if (message[2] == 0) {  // return the current marker
-                        uart_putc(UART_ID, positionMarker[positionIndex]);
-                        uart_puts(UART_ID, "\r\n");
+                        uart_println((char[2]){positionMarker[positionIndex]});
                     }
                     else if ((message[2] - '0' >= 0) && (message[2] - '0' < 4)) { // set the position marker
                         positionIndex = message[2] - '0';
-                        uart_puts(UART_ID, "OK\r\n");
+                        uart_println("OK");
                     }
-                    else uart_puts(UART_ID, "?\r\n");
+                    else uart_println("?");
 
 
                     break;
@@ -289,36 +285,32 @@ void process_command(const char* message) {
                     if (message[2] == 0) { // display the reset time
                         char convertido[6];
                         sprintf(convertido, "%u", resetTime);
-                        uart_puts(UART_ID, convertido);
-                        uart_puts(UART_ID, "\r\n");
+                        uart_println(convertido);
                     }
                     else {
                         char substr[20];
                         strcpy(substr, &(message[2]));
                         resetTime = atoi(substr);
-                        uart_puts(UART_ID,"OK\r\n");
+                        uart_println("OK");
                     }
                     break;
                 case 'V': // Lane reversal (ov/ov1/ov0) - GPRM sends 'ov0'
-                    uart_puts(UART_ID, "OK\r\n");
+                    uart_println("OK");
                     break;
                 case 'W': // set / read photo finish trigger length - GPRM sends 'ow15'
-                    uart_puts(UART_ID, "OK\r\n");
-                    break;
-                case 'X': // DTX000 mode (not supported)
-                    uart_puts(UART_ID, "\r\n");
+                    uart_println("OK");
                     break;
                 default:
-                    uart_puts(UART_ID, "?\r\n");
+                    uart_println("?");
                     break;
             }
 
             break;
         case 'V':
-            uart_puts(UART_ID,"PiDerby\r\n");
+            uart_println("PiDerby");
             break;
         default: // no idea what to do
-            uart_puts(UART_ID, "?\r\n");
+            uart_println("?");
             break;
     }
     message = '\0';
@@ -366,8 +358,8 @@ void print_finish_order (void) {
     qsort(raceData, numLanes, sizeof(raceData[0]), laneindexSort);
 
     for (unsigned int i = 0; i < numLanes; i++) {
-        uart_putc(UART_ID, (char)(laneMarker[laneIndex] + i));
-        uart_putc(UART_ID, '=');
+        uart_print ((char[2]){(laneMarker[laneIndex] + i)});
+        uart_print("=");
 
         float time = (float)raceData[i].laneticks / 100000;
         char convertido[16];
@@ -377,22 +369,22 @@ void print_finish_order (void) {
             uint8_t strLength;
             if (time >= 10) strLength = numDec + 3;
             else strLength = numDec + 2;
-
-            for (uint8_t i = 0; i < strLength; i++) uart_putc(UART_ID, convertido[i]);
+            
+            for (uint8_t i = 0; i < strLength; i++) uart_print((char[2]){convertido[i]});
         }
         else {
-            uart_puts(UART_ID, "10.");
-            for (uint8_t i = 0; i < numDec; i++) uart_putc(UART_ID,'0');
+            uart_print("10.");
+            for (uint8_t i = 0; i < numDec; i++) uart_print("0");
         }
         if (laneFinishPosition[i]) {
-            uart_putc(UART_ID, (char)(laneFinishPosition[i] - 1 + positionMarker[positionIndex]));
+            uart_print((char[2]){laneFinishPosition[i] - 1 + positionMarker[positionIndex]});
         }
         else {
-            uart_putc(UART_ID, ' ');
+            uart_print(" ");
         }
-        uart_putc(UART_ID, ' ');
+        uart_print(" ");
     }
-    uart_puts(UART_ID, "\r\n");
+    uart_println("");
 }
 
 bool are_we_done(void) {
@@ -478,7 +470,7 @@ void clear_displays(void) {
 }
 
 int main() {
-    i2c_init(I2C_PORT, 100 * 1000);
+    i2c_init(I2C_PORT, 400 * 1000);
     gpio_set_function(SDAPIN, GPIO_FUNC_I2C);
     gpio_set_function(SCLPIN, GPIO_FUNC_I2C);
     gpio_pull_up(SDAPIN);
@@ -496,10 +488,8 @@ int main() {
     uart_set_fifo_enabled(UART_ID, false);
     
 
-
-    uart_puts(UART_ID, "\r\nPiderby Startup\r\n");
-
-
+    uart_println("PiDerby");
+    
     uint8_t lane[]=" L  ";
     
     uint8_t brightness=10;
