@@ -18,12 +18,14 @@
 #define UART_RX_PIN 1
 #define GATE_PIN 22
 #define I2C_PORT i2c0
+#define SDAPIN 4
+#define SCLPIN 5
 
 
 uint8_t numLanes = 8;
 uint8_t numDec = 4;
 uint8_t gpio[] = {11,12,13,14,15,16,17,18};
-const int LaneAddresses[8] =  {0x75, 0x74, 0x73, 0x72, 0x71, 0x70, 0x69, 0x68}; // Lanes 8 through 1 (As seen from the start gate)
+static int LaneAddresses[8] =  {0x75, 0x74, 0x73, 0x72, 0x71, 0x70, 0x69, 0x68};
 
 uint64_t laneTicks[8];
 uint8_t laneFinishPosition[8];
@@ -33,7 +35,7 @@ uint8_t char_rxed = 0;
 uint8_t positionMarker[4]={'a','A','1','!'};
 uint8_t positionIndex = 0;
 uint8_t laneMarker[4] = {'A','1','a','A'};
-char dnf[5]={' ','d','n','F','\0'};
+char dnf[]="dnF";
 
 uint8_t laneIndex = 0;
 int32_t alarmID;
@@ -43,9 +45,15 @@ char msg[50];
 char * msgptr=msg;
 
 bool racing = false;
+bool preparing = false;
 bool masking = false;
 bool laneEnabled[8];
 bool laneMasked[8];
+
+uint8_t resetcursor='v';
+uint8_t brightness_control=0x7A;
+uint8_t clear_display=0x76;
+
 
 struct lanestruct {
     uint32_t laneticks;
@@ -76,24 +84,27 @@ int laneindexSort(const void *a, const void *b) {
         return 0;
 }
 
-int hz = 25;
-repeating_timer_t timer1,timer2;
-
 void process_finish_order();
 void print_finish_order();
 void process_command(const char* message);
-bool send_times(repeating_timer_t *rt);
-bool send_positions(repeating_timer_t *rt);
-void rotate_displays(bool enable);
+void send_times(void);
+void send_positions(void);
 void clear_displays(void);
-
 void lane_text(uint8_t laneindex, const char* text);
 void lane_time(uint8_t laneindex, const char* time);
+void prepare_race(void);
 
 void lane_enable(uint8_t laneindex, bool active) {
     gpio_set_irq_enabled(gpio[laneindex], GPIO_IRQ_EDGE_FALL, active);
     laneEnabled[laneindex] = active;
 }
+
+void i2c_write_byte(int laneindex, uint8_t val) {
+    i2c_write_blocking(I2C_PORT, LaneAddresses[laneindex], &val, 1, false);
+    sleep_us(600);
+}
+
+
 
 int64_t alarm_callback(alarm_id_t id, void *user_data) {
     // do stuff to end the incomplete race
@@ -111,6 +122,10 @@ void reset(void) {
         lane_enable(i, false);
     }
     uart_puts(UART_ID,"OK\r\n");
+}
+
+void prepare_race(void) {
+    preparing = true;
 }
 
 void start_race() {
@@ -300,7 +315,7 @@ void process_command(const char* message) {
 
             break;
         case 'V':
-            uart_puts(UART_ID,"eTekGadget SmartLine Timer\r\n");
+            uart_puts(UART_ID,"PiDerby\r\n");
             break;
         default: // no idea what to do
             uart_puts(UART_ID, "?\r\n");
@@ -315,8 +330,7 @@ void gpio_callback(uint gpio, uint32_t events) {
             start_race();
         }
         else {
-            rotate_displays(false); // The gate is up and we are preparing for a new race - stop displaying the previous race's data
-            clear_displays();
+            prepare_race();
         }
     }
     else {
@@ -393,55 +407,59 @@ bool are_we_done(void) {
         cancel_alarm(alarmID);
         racing = false;
         print_finish_order();
-        rotate_displays(true);
         gpio_set_irq_enabled(GATE_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
+        send_times();
     }
     return done;
 }
 
 void lane_text(uint8_t laneindex, const char* text) {
-    char clear = 'v'; //0x76
-    i2c_write_blocking(I2C_PORT, LaneAddresses[laneindex], &clear, 1, true);
+    i2c_write_byte(laneindex, clear_display);
     i2c_write_blocking(I2C_PORT, LaneAddresses[laneindex], text, strlen(text), false);
 }
 
 void lane_time(uint8_t laneindex, const char* time) {
-    char clear = 'v'; //0x76
-    char dec[3]={0x77,0x01,0}; // enable decimal control and turn on the first bit
-    i2c_write_blocking(I2C_PORT, LaneAddresses[laneindex], &clear, 1, true);
+    i2c_write_byte(laneindex, clear_display);
     
-    //write the time digits
-    i2c_write_blocking(I2C_PORT, LaneAddresses[laneindex], time, 1, true);  // the whole digit
-    i2c_write_blocking(I2C_PORT, LaneAddresses[laneindex], &(time[2]), 3, true); // the first three digits of the time, skipping the decimal point in the string
+    //write the time digits - skipping the decimal point (assuming a sub 10 second time)
+    i2c_write_byte(laneindex, time[0]);
+    i2c_write_byte(laneindex, time[2]);
+    i2c_write_byte(laneindex, time[3]);
+    i2c_write_byte(laneindex, time[4]);
     
     //write the decimal point
+    char dec[3]={0x77,0x01,0}; // enable decimal control and turn on the first bit
     i2c_write_blocking(I2C_PORT, LaneAddresses[laneindex], dec, 2, false);
 }
 
 
-bool send_times(repeating_timer_t *rt) {
-   for (uint8_t i = 0; i < numLanes; i++) {
-
+void send_times(void) {
+    for (uint8_t i = 0; i < numLanes; i++) {
         float time = (float)raceData[i].laneticks / 100000;
         char convertido[16];
         sprintf(convertido, "%.3f", time);
 
-        if (!laneMasked[i] && time < 10) {
-            lane_time(i,convertido);
+        if (!laneMasked[i]) {
+            if (time < 10) {
+                lane_time(i,convertido);
+            }
+            else {
+                lane_text(i,dnf);
+            }
         }
         else {
-            lane_text(i,dnf);
+
         }
     }
 }
 
-bool send_positions(repeating_timer_t *rt) {
+void send_positions(void) {
     char message[5];
     message[0]=' ';
     message[1]=' ';
     message[3]=' ';
     message[4]='\0';
-        for (uint8_t i = 0; i < numLanes; i++) {
+    for (uint8_t i = 0; i < numLanes; i++) {
         if (!laneMasked[i] && raceData[i].laneticks / 100000 < 10) {
             message[2]='0' + laneFinishPosition[i];
             lane_text(i,message);
@@ -452,30 +470,19 @@ bool send_positions(repeating_timer_t *rt) {
     }
 }
 
-void rotate_displays(bool enable) {
-    if (enable) { // enable recurring timers to send times and send positions
-        if (!add_repeating_timer_ms(-8000 / hz, send_times, NULL, &timer1)) { // send times every 8 seconds
-            // something bad happened
-        }
-        sleep_ms(4000);
-        if (!add_repeating_timer_ms(-8000 / hz, send_positions, NULL, &timer2)) { // wait 4 seconds and start sending lane positions every 8 seconds
-            // something bad happened
-        }
-    }
-    else {  // disable recorring timers to send times and send positions.
-        cancel_repeating_timer(&timer1);
-        cancel_repeating_timer(&timer2);
-    }
-}
-
 void clear_displays(void) {
-    char clear[2] = {'v','\0'};
     for (uint8_t i = 0; i < numLanes; i++) {
-        i2c_write_blocking(I2C_PORT, LaneAddresses[i], clear, strlen(clear), false);
+        sleep_us(600);
+        i2c_write_byte(i, clear_display);
     }
 }
 
 int main() {
+    i2c_init(I2C_PORT, 100 * 1000);
+    gpio_set_function(SDAPIN, GPIO_FUNC_I2C);
+    gpio_set_function(SCLPIN, GPIO_FUNC_I2C);
+    gpio_pull_up(SDAPIN);
+    gpio_pull_up(SCLPIN);
     uart_init(UART_ID, 2400);
     gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
     gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
@@ -488,25 +495,28 @@ int main() {
     uart_set_irq_enables(UART_ID, true, false);
     uart_set_fifo_enabled(UART_ID, false);
     
-    i2c_init(I2C_PORT, 400 * 1000);
-    gpio_set_function(4, GPIO_FUNC_I2C);
-    gpio_set_function(5, GPIO_FUNC_I2C);
-    gpio_pull_up(4);
-    gpio_pull_up(5);
 
 
-    uart_puts(UART_ID, "\r\nPiderby\r\n");
+    uart_puts(UART_ID, "\r\nPiderby Startup\r\n");
 
-    char buf[5];
-    buf[0]=' ';
-    buf[1]='L';
-    buf[3]=' ';
-    buf[4]='\0';
 
+    uint8_t lane[]=" L  ";
+    
+    uint8_t brightness=10;
+    
+    
     for (uint8_t i = 0; i < numLanes; i++) {
-        buf[2]='1' + i;
-        lane_text(i,buf);
+        i2c_write_byte(i, brightness_control);
+        sleep_us(600);
+        i2c_write_blocking(I2C_PORT, LaneAddresses[i] , &brightness, 2, false);
+        sleep_us(600);
+        i2c_write_byte(i, clear_display);
+        sleep_us(600);
+        lane[2]='1' + i;
+        i2c_write_blocking(I2C_PORT, LaneAddresses[i] , lane, strlen(lane), false);
     }
+    
+
     
 
     gpio_set_irq_enabled_with_callback(GATE_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &gpio_callback);
@@ -520,6 +530,10 @@ int main() {
     while (1) {
         if (racing) {
             are_we_done();
+        }
+        else if (preparing) {
+            clear_displays();
+            preparing = false;
         }
         sleep_us(10);
     }
