@@ -21,7 +21,6 @@
 #define SDAPIN 4
 #define SCLPIN 5
 
-
 uint8_t numLanes = 8;
 uint8_t numDec = 4;
 uint8_t gpio[] = {11,12,13,14,15,16,17,18};
@@ -43,15 +42,11 @@ uint8_t laneMarker[4] = {'A','1','a','A'};
 char dnf[]="dnF";
 
 uint8_t laneIndex = 0;
-int32_t alarmID;
+int32_t alarmID1,alarm_times,alarm_positions;
 uint8_t resetTime = 0; // seconds between automatic reset between races
 
 char msg[50];
 char * msgptr=msg;
-
-bool racing = false;
-bool preparing = false;
-bool masking = false;
 
 struct lane {
     bool enabled;
@@ -61,16 +56,28 @@ struct lane {
 
 struct lane lanes[8];
 
-struct lanestruct {
+struct lanedata {
     uint32_t laneticks;
     uint8_t laneindex;
 };
 
-struct lanestruct raceData[8];
+struct lanedata raceData[8];
+
+enum racestate {
+    nothing,
+    preparing,
+    racing,
+    times,
+    positions
+};
+
+enum racestate action = nothing;
+
+
 
 int laneticksSort(const void *a, const void *b) {
-    struct lanestruct *a1 = (struct lanestruct *)a;
-    struct lanestruct *a2 = (struct lanestruct *)b;
+    struct lanedata *a1 = (struct lanedata *)a;
+    struct lanedata *a2 = (struct lanedata *)b;
     if ((*a1).laneticks < (*a2).laneticks)
         return -1;
     else if ((*a1).laneticks > (*a2).laneticks)
@@ -80,8 +87,8 @@ int laneticksSort(const void *a, const void *b) {
 }
 
 int laneindexSort(const void *a, const void *b) {
-    struct lanestruct *a1 = (struct lanestruct *)a;
-    struct lanestruct *a2 = (struct lanestruct *)b;
+    struct lanedata *a1 = (struct lanedata *)a;
+    struct lanedata *a2 = (struct lanedata *)b;
     if ((*a1).laneindex < (*a2).laneindex)
         return -1;
     else if ((*a1).laneindex > (*a2).laneindex)
@@ -98,7 +105,6 @@ void send_positions(void);
 void clear_displays(void);
 void lane_text(uint8_t laneindex, const char* text);
 void lane_time(uint8_t laneindex, const char* time);
-void prepare_race(void);
 
 void lane_enable(uint8_t laneindex, bool active) {
     gpio_set_irq_enabled(gpio[laneindex], GPIO_IRQ_EDGE_FALL, active);
@@ -131,9 +137,16 @@ int64_t alarm_callback(alarm_id_t id, void *user_data) {
     return 0;
 }
 
+int64_t times_callback(alarm_id_t id, void *user_data) {
+    action = times;
+}
+int64_t positions_callback(alarm_id_t id, void *user_data) {
+    action = positions;
+}
+
 void reset(void) {
     gate_switch_en(true);
-    racing = false;
+    action = nothing;
     for (uint8_t i = 0; i < numLanes; i++) {
         lane_enable(i, false);
     }
@@ -141,7 +154,10 @@ void reset(void) {
 }
 
 void start_race() {
-    alarmID = add_alarm_in_ms(10000, alarm_callback, NULL, false);
+    alarmID1 = add_alarm_in_ms(10000, alarm_callback, NULL, false);
+    cancel_alarm(alarm_times);
+    cancel_alarm(alarm_positions);
+    if (!alarmID1) uart_println("Could not create 10 second timer");
     for (uint8_t i = 0; i < numLanes; i++) {
         lane_enable(i, !lanes[i].masked);
         laneTicks[i] = previousTicks + 10000000;
@@ -149,8 +165,16 @@ void start_race() {
     clear_displays();
     uart_println("They're off!");
     gate_switch_en(false); 
-    preparing = false;
-    racing = true;
+    action = racing;
+}
+
+void end_race() {
+    cancel_alarm(alarmID1);
+    print_finish_order();
+    gate_switch_en(true);
+    send_times();
+    alarm_positions = add_alarm_in_ms (4000,positions_callback, NULL, true);
+    action = nothing;
 }
 
 void on_uart_rx() {
@@ -187,7 +211,7 @@ void process_command(const char* message) {
         case 'R':
             switch (toupper(message[1])) {
                 case 'A': // Force end of race, return results, then reset
-                    racing = false;
+                    action = times;
                     for (uint8_t i = 0; i < numLanes; i++) {
                         lanes[i].act_disable = true;
                         //laneEnabled[i] = false;
@@ -328,7 +352,12 @@ void gpio_callback(uint gpio, uint32_t events) {
     if (gpio == GATE_PIN) {
         if (events == 0x8) {
             previousTicks = time_us_64 ();
-            preparing = true;
+            action = preparing;
+        }
+        else {
+            cancel_alarm(alarm_times);
+            cancel_alarm(alarm_positions);
+            action = nothing;
         }
     }
     else {
@@ -393,7 +422,7 @@ void print_finish_order (void) {
     uart_println("");
 }
 
-bool are_we_done(void) {
+bool racing_complete(void) {
     bool done = true;
     for (uint8_t i = 0; i < numLanes; i++) {
         if (!lanes[i].masked) {
@@ -403,13 +432,6 @@ bool are_we_done(void) {
             }
             if (lanes[i].enabled) done = false;
         }
-    }
-    if (done) {
-        cancel_alarm(alarmID);
-        racing = false;
-        print_finish_order();
-        gate_switch_en(true); //gpio_set_irq_enabled(GATE_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
-        send_times();
     }
     return done;
 }
@@ -437,20 +459,16 @@ void lane_time(uint8_t laneindex, const char* time) {
 
 void send_times(void) {
     for (uint8_t i = 0; i < numLanes; i++) {
-        float time = (float)raceData[i].laneticks / 100000;
-        char convertido[16];
-        sprintf(convertido, "%.3f", time);
-
         if (!lanes[i].masked) {
+            float time = (float)raceData[i].laneticks / 100000;
+            char convertido[7];
+            sprintf(convertido, "%.3f", time);
             if (time < 10) {
                 lane_time(i,convertido);
             }
             else {
                 lane_text(i,dnf);
             }
-        }
-        else {
-
         }
     }
 }
@@ -503,7 +521,7 @@ int main() {
 
     uart_println("PiDerby");
     
-    uint8_t lane[]=" L  ";
+    uint8_t lane[5]={' ','L',' ',' ','\0'};
     
     uint8_t brightness=10;
     
@@ -512,10 +530,8 @@ int main() {
         i2c_write_byte(i, &brightness_control);
         i2c_write_blocking(I2C_PORT, LaneAddresses[i] , &brightness, 2, false);
         sleep_us(600);
-        i2c_write_byte(i, &clear_display);
         lane[2]='1' + i;
         lane_text(i, lane);
-        //i2c_write_blocking(I2C_PORT, LaneAddresses[i] , lane, strlen(lane), false);
     }
     
     gpio_set_irq_enabled_with_callback(GATE_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &gpio_callback);
@@ -525,15 +541,34 @@ int main() {
         gpio_pull_up(gpio[i]);
         lanes[i].masked = false;
     }
-
+    
     while (1) {
-        if (racing) {
-            are_we_done();
+        switch (action) {
+            case preparing:
+                start_race();
+                break;
+            case racing:
+                if (racing_complete()) {
+                    end_race();
+                }
+                break;
+            case times:
+                cancel_alarm(alarm_times);
+                send_times();
+                action = nothing;
+                alarm_positions = add_alarm_in_ms (4000,positions_callback, NULL, true);
+                break;
+            case positions:
+                cancel_alarm(alarm_positions);
+                send_positions();
+                action = nothing;
+                alarm_times = add_alarm_in_ms (4000,times_callback, NULL, true);
+                break;
+            case nothing:
+            default:
+                break;
         }
-        else if (preparing) {
-            start_race();
-        }
+        sleep_us(5);
     }
-
     return 0;
 }
