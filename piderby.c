@@ -7,7 +7,7 @@
 #include "hardware/uart.h"
 #include "hardware/irq.h"
 #include "hardware/i2c.h"
-#include "math.h"
+//#include "math.h"
 
 #define UART_ID uart0
 #define BAUD_RATE 9600
@@ -25,7 +25,12 @@
 uint8_t numLanes = 8;
 uint8_t numDec = 4;
 uint8_t gpio[] = {11,12,13,14,15,16,17,18};
+
+//i2c addresses and commands
 static int LaneAddresses[8] =  {0x75, 0x74, 0x73, 0x72, 0x71, 0x70, 0x69, 0x68};
+uint8_t brightness_control=0x7A;
+uint8_t clear_display=0x76;
+
 
 uint64_t laneTicks[8];
 uint8_t laneFinishPosition[8];
@@ -47,13 +52,14 @@ char * msgptr=msg;
 bool racing = false;
 bool preparing = false;
 bool masking = false;
-bool laneEnabled[8];
-bool laneMasked[8];
 
-uint8_t resetcursor='v';
-uint8_t brightness_control=0x7A;
-uint8_t clear_display=0x76;
+struct lane {
+    bool enabled;
+    bool act_disable;
+    bool masked;
+};
 
+struct lane lanes[8];
 
 struct lanestruct {
     uint32_t laneticks;
@@ -96,11 +102,11 @@ void prepare_race(void);
 
 void lane_enable(uint8_t laneindex, bool active) {
     gpio_set_irq_enabled(gpio[laneindex], GPIO_IRQ_EDGE_FALL, active);
-    laneEnabled[laneindex] = active;
+    lanes[laneindex].enabled = active;
 }
 
-void i2c_write_byte(int laneindex, uint8_t val) {
-    i2c_write_blocking(I2C_PORT, LaneAddresses[laneindex], &val, 1, false);
+void i2c_write_byte(int laneindex, const uint8_t* val) {
+    i2c_write_blocking(I2C_PORT, LaneAddresses[laneindex], val, 1, false);
     sleep_us(600);
 }
 
@@ -110,6 +116,10 @@ void uart_print(const char* string) {
 void uart_println(const char* string) {
     uart_puts(UART_ID, string);
     uart_puts(UART_ID, "\r\n");
+}
+
+void gate_switch_en(bool enable) {
+    gpio_set_irq_enabled(GATE_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, enable);
 }
 
 int64_t alarm_callback(alarm_id_t id, void *user_data) {
@@ -122,7 +132,7 @@ int64_t alarm_callback(alarm_id_t id, void *user_data) {
 }
 
 void reset(void) {
-    gpio_set_irq_enabled(GATE_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
+    gate_switch_en(true);
     racing = false;
     for (uint8_t i = 0; i < numLanes; i++) {
         lane_enable(i, false);
@@ -130,19 +140,16 @@ void reset(void) {
     uart_println("OK");
 }
 
-void prepare_race(void) {
-    preparing = true;
-}
-
 void start_race() {
-    previousTicks = time_us_64 ();
     alarmID = add_alarm_in_ms(10000, alarm_callback, NULL, false);
     for (uint8_t i = 0; i < numLanes; i++) {
-        lane_enable(i, !laneMasked[i]);
-        laneTicks[i] = previousTicks + 9999999;
+        lane_enable(i, !lanes[i].masked);
+        laneTicks[i] = previousTicks + 10000000;
     }
+    clear_displays();
     uart_println("They're off!");
-    gpio_set_irq_enabled(GATE_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
+    gate_switch_en(false); 
+    preparing = false;
     racing = true;
 }
 
@@ -182,8 +189,9 @@ void process_command(const char* message) {
                 case 'A': // Force end of race, return results, then reset
                     racing = false;
                     for (uint8_t i = 0; i < numLanes; i++) {
-                        laneEnabled[i] = false;
-                        lane_enable(i, false);
+                        lanes[i].act_disable = true;
+                        //laneEnabled[i] = false;
+                        //lane_enable(i, false);
                     }
                     print_finish_order();
                     break;
@@ -198,7 +206,7 @@ void process_command(const char* message) {
                     break;
                 case 'L': // Read lane switches
                     for (uint8_t i = 0; i < numLanes; i++) {
-                        if (!laneMasked[i]) uart_print((char[2]){(int)(gpio_get(gpio[i])) + '0'});
+                        if (!lanes[i].masked) uart_print((char[2]){(int)(gpio_get(gpio[i])) + '0'});
                         else uart_print("-");
                     }
                     uart_println("");
@@ -239,19 +247,19 @@ void process_command(const char* message) {
                 case 'M': // Set Read lane mask
                     if (message[2] == 0) { // show the masked lanes
                         for (uint8_t i = 0; i < numLanes; i++ ) {
-                            if (laneMasked[i]) uart_print((char[2]){i + '1'});
+                            if (lanes[i].masked) uart_print((char[2]){i + '1'});
                         }
                         uart_println("");
                     }
                     else { 
                         uint8_t chardec = message[2] - '0';
                         if (chardec > 0 && chardec < numLanes + 1) {
-                            laneMasked[chardec - 1] = true;
+                            lanes[chardec - 1].masked = true;
                             uart_println("OK");
                         }
                         else if (chardec == 0) {
                             for (uint8_t i = 0; i < numLanes; i++ ) {
-                                laneMasked[i] = false;
+                                lanes[i].masked = false;
                             }
                             uart_println("OK");
                         }
@@ -319,21 +327,19 @@ void process_command(const char* message) {
 void gpio_callback(uint gpio, uint32_t events) {
     if (gpio == GATE_PIN) {
         if (events == 0x8) {
-            start_race();
-        }
-        else {
-            prepare_race();
+            previousTicks = time_us_64 ();
+            preparing = true;
         }
     }
     else {
         laneTicks[gpio - 11] = time_us_64 ();
-        laneEnabled[gpio - 11] = false;
+        lanes[gpio - 11].act_disable = true;
     }
 }
 
 void process_finish_order (void) {
     for (uint8_t i = 0; i < numLanes; i++) {
-        raceData[i].laneticks = round((float)(laneTicks[i] - previousTicks) / 10);;
+        raceData[i].laneticks = (float)(laneTicks[i] - previousTicks) / 10;;
         raceData[i].laneindex = i;
     }
 
@@ -365,7 +371,7 @@ void print_finish_order (void) {
         char convertido[16];
         sprintf(convertido, "%.5f", time);
 
-        if (!laneMasked[i]) {
+        if (!lanes[i].masked) {
             uint8_t strLength;
             if (time >= 10) strLength = numDec + 3;
             else strLength = numDec + 2;
@@ -390,34 +396,38 @@ void print_finish_order (void) {
 bool are_we_done(void) {
     bool done = true;
     for (uint8_t i = 0; i < numLanes; i++) {
-        if (laneEnabled[i] && !laneMasked[i]) {
-            done = false;
+        if (!lanes[i].masked) {
+            if (lanes[i].act_disable) {
+                lane_enable(i, false);
+                lanes[i].act_disable = false;
+            }
+            if (lanes[i].enabled) done = false;
         }
-        else lane_enable(i, false);
     }
     if (done) {
         cancel_alarm(alarmID);
         racing = false;
         print_finish_order();
-        gpio_set_irq_enabled(GATE_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
+        gate_switch_en(true); //gpio_set_irq_enabled(GATE_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
         send_times();
     }
     return done;
 }
 
 void lane_text(uint8_t laneindex, const char* text) {
-    i2c_write_byte(laneindex, clear_display);
+    i2c_write_byte(laneindex, &clear_display);
     i2c_write_blocking(I2C_PORT, LaneAddresses[laneindex], text, strlen(text), false);
+    sleep_us(600);
 }
 
 void lane_time(uint8_t laneindex, const char* time) {
-    i2c_write_byte(laneindex, clear_display);
+    i2c_write_byte(laneindex, &clear_display);
     
     //write the time digits - skipping the decimal point (assuming a sub 10 second time)
-    i2c_write_byte(laneindex, time[0]);
-    i2c_write_byte(laneindex, time[2]);
-    i2c_write_byte(laneindex, time[3]);
-    i2c_write_byte(laneindex, time[4]);
+    i2c_write_byte(laneindex, &(time[0]));
+    i2c_write_byte(laneindex, &(time[2]));
+    i2c_write_byte(laneindex, &(time[3]));
+    i2c_write_byte(laneindex, &(time[4]));
     
     //write the decimal point
     char dec[3]={0x77,0x01,0}; // enable decimal control and turn on the first bit
@@ -431,7 +441,7 @@ void send_times(void) {
         char convertido[16];
         sprintf(convertido, "%.3f", time);
 
-        if (!laneMasked[i]) {
+        if (!lanes[i].masked) {
             if (time < 10) {
                 lane_time(i,convertido);
             }
@@ -452,7 +462,7 @@ void send_positions(void) {
     message[3]=' ';
     message[4]='\0';
     for (uint8_t i = 0; i < numLanes; i++) {
-        if (!laneMasked[i] && raceData[i].laneticks / 100000 < 10) {
+        if (!lanes[i].masked && raceData[i].laneticks / 100000 < 10) {
             message[2]='0' + laneFinishPosition[i];
             lane_text(i,message);
         }
@@ -465,16 +475,19 @@ void send_positions(void) {
 void clear_displays(void) {
     for (uint8_t i = 0; i < numLanes; i++) {
         sleep_us(600);
-        i2c_write_byte(i, clear_display);
+        i2c_write_byte(i, &clear_display);
     }
 }
 
 int main() {
+    //setup i2c
     i2c_init(I2C_PORT, 400 * 1000);
     gpio_set_function(SDAPIN, GPIO_FUNC_I2C);
     gpio_set_function(SCLPIN, GPIO_FUNC_I2C);
-    gpio_pull_up(SDAPIN);
+    gpio_pull_up(SDAPIN); // i2c bus requires pull-ups on the data and clock lines
     gpio_pull_up(SCLPIN);
+    
+    //setup uart
     uart_init(UART_ID, 2400);
     gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
     gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
@@ -496,25 +509,21 @@ int main() {
     
     
     for (uint8_t i = 0; i < numLanes; i++) {
-        i2c_write_byte(i, brightness_control);
-        sleep_us(600);
+        i2c_write_byte(i, &brightness_control);
         i2c_write_blocking(I2C_PORT, LaneAddresses[i] , &brightness, 2, false);
         sleep_us(600);
-        i2c_write_byte(i, clear_display);
-        sleep_us(600);
+        i2c_write_byte(i, &clear_display);
         lane[2]='1' + i;
-        i2c_write_blocking(I2C_PORT, LaneAddresses[i] , lane, strlen(lane), false);
+        lane_text(i, lane);
+        //i2c_write_blocking(I2C_PORT, LaneAddresses[i] , lane, strlen(lane), false);
     }
     
-
-    
-
     gpio_set_irq_enabled_with_callback(GATE_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &gpio_callback);
 
     for (uint8_t i = 0; i < numLanes; i++) {
         gpio_init(gpio[i]);
         gpio_pull_up(gpio[i]);
-        laneMasked[i] = false;
+        lanes[i].masked = false;
     }
 
     while (1) {
@@ -522,10 +531,8 @@ int main() {
             are_we_done();
         }
         else if (preparing) {
-            clear_displays();
-            preparing = false;
+            start_race();
         }
-        sleep_us(10);
     }
 
     return 0;
