@@ -43,7 +43,8 @@ int32_t alarmID1,alarm_times,alarm_positions;
 uint8_t resetTime = 0; // seconds between automatic reset between races
 
 char dnf[]="dnF";
-char hashes[]="----";
+char success[]="Good";
+char test[]="----";
 
 char msg[50];
 char * msgptr=msg;
@@ -541,6 +542,7 @@ int main() {
     
     uint8_t brightness=10;
     
+    uint8_t activelanecount=0;
     
     for (uint8_t i = 0; i < numLanes; i++) {
         i2c_write_byte(i, &brightness_control);
@@ -561,12 +563,14 @@ int main() {
     while (1) {
         switch (action) {
             case preptest:
+                activelanecount = 0;
                 cancel_alarm(alarm_positions);
                 cancel_alarm(alarm_times);
                 for (uint8_t i = 0; i < numLanes; i++) {
                     if (!lanes[i].masked) {
-                        lane_text(i, hashes);
-                        lane_enable(i, !lanes[i].masked);
+                        activelanecount++;
+                        lane_text(i, test);
+                        lane_enable(i, true);
                     }
                  }
                 action = testing;
@@ -574,9 +578,17 @@ int main() {
             case testing:
                 for (uint8_t i = 0; i < numLanes; i++) {
                     if (lanes[i].triggered == true) {
-                        i2c_write_byte(i, &clear_display);
+                        lane_text(i, success);
+                        lane_enable(i, false);
                         lanes[i].triggered = false;
+                        activelanecount--;
                     }
+                }
+                if (!activelanecount) { // we've successfully triggered all of the lanes
+                    uart_println("All Lanes Successfully Tested");
+                    sleep_ms(1000);
+                    clear_displays();
+                    action = nothing;
                 }
                 break;
             case preparing:
