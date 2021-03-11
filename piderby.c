@@ -26,45 +26,49 @@ uint8_t numDec = 4;
 uint8_t gpio[] = {11,12,13,14,15,16,17,18};
 
 //i2c addresses and commands
-static int LaneAddresses[8] =  {0x75, 0x74, 0x73, 0x72, 0x71, 0x70, 0x69, 0x68};
+int LaneAddresses[8] =  {0x75, 0x74, 0x73, 0x72, 0x71, 0x70, 0x69, 0x68};
 uint8_t brightness_control=0x7A;
 uint8_t clear_display=0x76;
 
-
-uint64_t laneTicks[8];
-uint8_t laneFinishPosition[8];
 uint64_t previousTicks;
 uint16_t positionAllowance = 1;
 uint8_t char_rxed = 0;
-uint8_t positionMarker[4]={'a','A','1','!'};
-uint8_t positionIndex = 0;
-uint8_t laneMarker[4] = {'A','1','a','A'};
-char dnf[]="dnF";
 
-uint8_t laneIndex = 0;
+uint8_t positionMarker[4]={'a','A','1','!'};
+uint8_t positionMarkerIndex = 0;
+uint8_t laneMarker[4] = {'A','1','a','A'};
+uint8_t laneMarkerIndex = 0;
+
 int32_t alarmID1,alarm_times,alarm_positions;
 uint8_t resetTime = 0; // seconds between automatic reset between races
+
+char dnf[]="dnF";
+char hashes[]="----";
 
 char msg[50];
 char * msgptr=msg;
 
 struct lane {
     bool enabled;
-    bool act_disable;
     bool masked;
+    bool triggered;
+    uint64_t ticks;
+    uint8_t finishPosition;
 };
 
 struct lane lanes[8];
 
 struct lanedata {
-    uint32_t laneticks;
-    uint8_t laneindex;
+    uint32_t ticks;
+    uint8_t index;
 };
 
 struct lanedata raceData[8];
 
 enum racestate {
     nothing,
+    preptest,
+    testing,
     preparing,
     racing,
     times,
@@ -78,9 +82,9 @@ enum racestate action = nothing;
 int laneticksSort(const void *a, const void *b) {
     struct lanedata *a1 = (struct lanedata *)a;
     struct lanedata *a2 = (struct lanedata *)b;
-    if ((*a1).laneticks < (*a2).laneticks)
+    if ((*a1).ticks < (*a2).ticks)
         return -1;
-    else if ((*a1).laneticks > (*a2).laneticks)
+    else if ((*a1).ticks > (*a2).ticks)
         return 1;
     else
         return 0;
@@ -89,9 +93,9 @@ int laneticksSort(const void *a, const void *b) {
 int laneindexSort(const void *a, const void *b) {
     struct lanedata *a1 = (struct lanedata *)a;
     struct lanedata *a2 = (struct lanedata *)b;
-    if ((*a1).laneindex < (*a2).laneindex)
+    if ((*a1).index < (*a2).index)
         return -1;
-    else if ((*a1).laneindex > (*a2).laneindex)
+    else if ((*a1).index > (*a2).index)
         return 1;
     else
         return 0;
@@ -157,10 +161,9 @@ void start_race() {
     alarmID1 = add_alarm_in_ms(10000, alarm_callback, NULL, false);
     cancel_alarm(alarm_times);
     cancel_alarm(alarm_positions);
-    if (!alarmID1) uart_println("Could not create 10 second timer");
     for (uint8_t i = 0; i < numLanes; i++) {
         lane_enable(i, !lanes[i].masked);
-        laneTicks[i] = previousTicks + 10000000;
+        lanes[i].ticks = previousTicks + 10000000;
     }
     clear_displays();
     uart_println("They're off!");
@@ -213,11 +216,18 @@ void process_command(const char* message) {
                 case 'A': // Force end of race, return results, then reset
                     action = times;
                     for (uint8_t i = 0; i < numLanes; i++) {
-                        lanes[i].act_disable = true;
+                        lanes[i].triggered = true;
                         //laneEnabled[i] = false;
                         //lane_enable(i, false);
                     }
                     print_finish_order();
+                    break;
+                case 'L': // Read lane switches
+                    for (uint8_t i = 0; i < numLanes; i++) {
+                        if (!lanes[i].masked) uart_print((char[2]){(int)(gpio_get(gpio[i])) + '0'});
+                        else uart_print("-");
+                    }
+                    uart_println("");
                     break;
                 case 'P': // Return reesults from previous race
                     print_finish_order();
@@ -228,12 +238,8 @@ void process_command(const char* message) {
                 case 'S': // Read start switch - active is gate is open and racing
                     uart_println((char[2]){(int)(gpio_get(GATE_PIN)) + '0'});  // I know this looks crazy. we're jut creating a null terminated string from a single char, created by a boolean value
                     break;
-                case 'L': // Read lane switches
-                    for (uint8_t i = 0; i < numLanes; i++) {
-                        if (!lanes[i].masked) uart_print((char[2]){(int)(gpio_get(gpio[i])) + '0'});
-                        else uart_print("-");
-                    }
-                    uart_println("");
+                case 'T':
+                    action = preptest;
                     break;
                 case '\0': // Reset
                     reset();
@@ -260,10 +266,10 @@ void process_command(const char* message) {
 
                 case 'L': // Set / Read lane character
                     if (message[2] == 0) {  // return the current marker
-                        uart_println((char[2]){laneMarker[laneIndex]});
+                        uart_println((char[2]){laneMarker[laneMarkerIndex]});
                     }
                     else if ((message[2] - '0' >= 0) && (message[2] - '0' < 4)) { // set the lane marker
-                        laneIndex = message[2] - '0';
+                        laneMarkerIndex = message[2] - '0';
                         uart_println("OK");
                     }
                     else uart_println("?");
@@ -303,10 +309,10 @@ void process_command(const char* message) {
                     break;
                 case 'P': // Set / Read place character
                     if (message[2] == 0) {  // return the current marker
-                        uart_println((char[2]){positionMarker[positionIndex]});
+                        uart_println((char[2]){positionMarker[positionMarkerIndex]});
                     }
                     else if ((message[2] - '0' >= 0) && (message[2] - '0' < 4)) { // set the position marker
-                        positionIndex = message[2] - '0';
+                        positionMarkerIndex = message[2] - '0';
                         uart_println("OK");
                     }
                     else uart_println("?");
@@ -361,42 +367,42 @@ void gpio_callback(uint gpio, uint32_t events) {
         }
     }
     else {
-        laneTicks[gpio - 11] = time_us_64 ();
-        lanes[gpio - 11].act_disable = true;
+        lanes[gpio - 11].triggered = true;
+        if (action != testing) lanes[gpio - 11].ticks = time_us_64 ();
     }
 }
 
 void process_finish_order (void) {
     for (uint8_t i = 0; i < numLanes; i++) {
-        raceData[i].laneticks = (float)(laneTicks[i] - previousTicks) / 10;;
-        raceData[i].laneindex = i;
+        raceData[i].ticks = (float)(lanes[i].ticks - previousTicks) / 10;
+        raceData[i].index = i;
     }
 
     qsort(raceData, numLanes, sizeof(raceData[0]), laneticksSort);
 
-    laneFinishPosition[raceData[0].laneindex] = 1;
+    lanes[raceData[0].index].finishPosition = 1;
     for (int i = 1; i < numLanes; i++) {
-        if (raceData[i].laneticks - raceData[i-1].laneticks <= positionAllowance) {
-            laneFinishPosition[raceData[i].laneindex] = laneFinishPosition[raceData[i-1].laneindex];
+        if (raceData[i].ticks - raceData[i-1].ticks <= positionAllowance) {
+            lanes[raceData[i].index].finishPosition = lanes[raceData[i-1].index].finishPosition;
         }
-        else if (raceData[i].laneticks == 1000000) {
-            laneFinishPosition[raceData[i].laneindex]=0;
+        else if (raceData[i].ticks == 1000000) {
+            lanes[raceData[i].index].finishPosition=0;
         }
         else {
-            laneFinishPosition[raceData[i].laneindex] = i + 1;
+            lanes[raceData[i].index].finishPosition = i + 1;
         }
     }
+    qsort(raceData, numLanes, sizeof(raceData[0]), laneindexSort);
 }
 
 void print_finish_order (void) {
     process_finish_order();
-    qsort(raceData, numLanes, sizeof(raceData[0]), laneindexSort);
-
+    
     for (unsigned int i = 0; i < numLanes; i++) {
-        uart_print ((char[2]){(laneMarker[laneIndex] + i)});
+        uart_print ((char[2]){(laneMarker[laneMarkerIndex] + i)});
         uart_print("=");
 
-        float time = (float)raceData[i].laneticks / 100000;
+        float time = (float)raceData[i].ticks / 100000;
         char convertido[16];
         sprintf(convertido, "%.5f", time);
 
@@ -411,8 +417,8 @@ void print_finish_order (void) {
             uart_print("10.");
             for (uint8_t i = 0; i < numDec; i++) uart_print("0");
         }
-        if (laneFinishPosition[i]) {
-            uart_print((char[2]){laneFinishPosition[i] - 1 + positionMarker[positionIndex]});
+        if (lanes[i].finishPosition) {
+            uart_print((char[2]){lanes[i].finishPosition - 1 + positionMarker[positionMarkerIndex]});
         }
         else {
             uart_print(" ");
@@ -426,9 +432,9 @@ bool racing_complete(void) {
     bool done = true;
     for (uint8_t i = 0; i < numLanes; i++) {
         if (!lanes[i].masked) {
-            if (lanes[i].act_disable) {
+            if (lanes[i].triggered) {
                 lane_enable(i, false);
-                lanes[i].act_disable = false;
+                lanes[i].triggered = false;
             }
             if (lanes[i].enabled) done = false;
         }
@@ -460,7 +466,7 @@ void lane_time(uint8_t laneindex, const char* time) {
 void send_times(void) {
     for (uint8_t i = 0; i < numLanes; i++) {
         if (!lanes[i].masked) {
-            float time = (float)raceData[i].laneticks / 100000;
+            float time = (float)raceData[i].ticks / 100000;
             char convertido[7];
             sprintf(convertido, "%.3f", time);
             if (time < 10) {
@@ -470,24 +476,34 @@ void send_times(void) {
                 lane_text(i,dnf);
             }
         }
+        else {
+            i2c_write_byte(i, &clear_display);
+        }
     }
 }
 
 void send_positions(void) {
+    //process_finish_order(); // just during testing to see how changing the allowance affects finish POSITION
     char message[5];
     message[0]=' ';
     message[1]=' ';
     message[3]=' ';
     message[4]='\0';
     for (uint8_t i = 0; i < numLanes; i++) {
-        if (!lanes[i].masked && raceData[i].laneticks / 100000 < 10) {
-            message[2]='0' + laneFinishPosition[i];
-            lane_text(i,message);
+        if (!lanes[i].masked) {
+            if (raceData[i].ticks / 100000 < 10) {
+                message[2]='0' + lanes[i].finishPosition;
+                lane_text(i,message);
+            }
+            else {
+                lane_text(i,dnf);
+            }
         }
         else {
-            lane_text(i,dnf);
+            i2c_write_byte(i, &clear_display);
         }
     }
+    
 }
 
 void clear_displays(void) {
@@ -521,7 +537,7 @@ int main() {
 
     uart_println("PiDerby");
     
-    uint8_t lane[5]={' ','L',' ',' ','\0'};
+    uint8_t lane[]=" L ";
     
     uint8_t brightness=10;
     
@@ -544,6 +560,25 @@ int main() {
     
     while (1) {
         switch (action) {
+            case preptest:
+                cancel_alarm(alarm_positions);
+                cancel_alarm(alarm_times);
+                for (uint8_t i = 0; i < numLanes; i++) {
+                    if (!lanes[i].masked) {
+                        lane_text(i, hashes);
+                        lane_enable(i, !lanes[i].masked);
+                    }
+                 }
+                action = testing;
+                break;
+            case testing:
+                for (uint8_t i = 0; i < numLanes; i++) {
+                    if (lanes[i].triggered == true) {
+                        i2c_write_byte(i, &clear_display);
+                        lanes[i].triggered = false;
+                    }
+                }
+                break;
             case preparing:
                 start_race();
                 break;
@@ -556,13 +591,13 @@ int main() {
                 cancel_alarm(alarm_times);
                 send_times();
                 action = nothing;
-                alarm_positions = add_alarm_in_ms (4000,positions_callback, NULL, true);
+                alarm_positions = add_alarm_in_ms (4000,positions_callback, NULL, false);
                 break;
             case positions:
                 cancel_alarm(alarm_positions);
                 send_positions();
                 action = nothing;
-                alarm_times = add_alarm_in_ms (4000,times_callback, NULL, true);
+                alarm_times = add_alarm_in_ms (4000,times_callback, NULL, false);
                 break;
             case nothing:
             default:
